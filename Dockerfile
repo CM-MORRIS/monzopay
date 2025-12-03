@@ -4,7 +4,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o monzopay ./...
+RUN CGO_ENABLED=0 GOOS=linux go build -o monzopay ./main.go
 
 # Final stage
 FROM alpine:latest
