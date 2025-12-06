@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package proto;
-option go_package = "github.com/CM-MORRIS/monzopay/pb";
+option go_package = "./generated";
 
 import "google/protobuf/empty.proto";
 
@@ -10,18 +10,15 @@ service PaymentService {
   rpc ProcessPayment (ProcessPaymentRequest) returns (ProcessPaymentResponse);
 }
 
-message HealthResponse {
-  string status = 1;
-}
-
+message HealthResponse { string status = 1; }
 message ProcessPaymentRequest {
   string from_account = 1;
   string to_account = 2;
   double amount = 3;
   string idempotency_key = 4;
 }
-
 message ProcessPaymentResponse {
   string payment_id = 1;
   string status = 2;
+  string trace_id = 3;
 }

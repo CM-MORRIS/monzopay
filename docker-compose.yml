@@ -20,27 +20,48 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
 
   cassandra:
-    image: cassandra:5.0
+    image: cassandra:4.1
     ports:
       - "9042:9042"
     environment:
       CASSANDRA_CLUSTER_NAME: monzopay-cluster
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 100M
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  cassandra-web:
+    image: ipushc/cassandra-web:latest
+    ports:
+      - "3001:8083"
+    environment:
+      CASSANDRA_HOST_IPS: cassandra
+      CASSANDRA_PORT: 9042
+    depends_on:
+      cassandra:
+        condition: service_healthy 
+
+
 
   tempo:
     image: grafana/tempo:latest
-    command: ["-config.file=/etc/tempo.yaml"]
+    command: ["-config.file=/etc/tempo.yml"]
     volumes:
-      - ./tempo-config.yaml:/etc/tempo.yaml
+      - ./deployments/tempo.yml:/etc/tempo.yml
     ports:
-      - "4317:4317"   # gRPC for traces
-      - "4318:4318"   # HTTP for traces
+      - "4317:4317"
+      - "3200:3200"
 
   prometheus:
     image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./deployments/prometheus.yml:/etc/prometheus/prometheus.yml
 
   grafana:
     image: grafana/grafana:latest
@@ -49,10 +70,26 @@ services:
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
-    depends_on: [prometheus, tempo]
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deployments/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    depends_on:
+      - prometheus
+      - tempo
 
   monzopay:
     build: .
     ports:
       - "8080:8080"
-    depends_on: [kafka, cassandra, tempo]
+    environment:
+      - CASSANDRA_HOST=cassandra
+    depends_on:
+      kafka:
+        condition: service_started
+      tempo:
+        condition: service_started
+      cassandra:
+        condition: service_healthy
+
+volumes:
+  grafana-data:
