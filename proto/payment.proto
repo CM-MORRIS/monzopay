@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package proto;
-option go_package = "./generated";
+option go_package = "github.com/CM-MORRIS/monzopay/generated;generated";
 
 import "google/protobuf/empty.proto";
 
@@ -14,7 +14,7 @@ message HealthResponse { string status = 1; }
 message ProcessPaymentRequest {
   string from_account = 1;
   string to_account = 2;
-  double amount = 3;
+  int64 amount = 3;
   string idempotency_key = 4;
 }
 message ProcessPaymentResponse {

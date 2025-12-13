@@ -2,97 +2,79 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"log"
 	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	pb "github.com/CM-MORRIS/monzopay/generated"
+	"github.com/CM-MORRIS/monzopay/internal/repository"
+	"github.com/CM-MORRIS/monzopay/internal/service"
 	"github.com/gocql/gocql"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	// TRACING ONLY - no Kafka!
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-	"go.opentelemetry.io/otel/trace"
 )
 
 var cassandra *gocql.Session
-var tracer trace.Tracer // Global tracer
 
 func init() {
-	// Step 1: Connect WITHOUT keyspace
+	// ... your existing Cassandra init logic ...
 	for i := 0; i < 30; i++ {
 		cluster := gocql.NewCluster("cassandra")
 		cluster.Consistency = gocql.Quorum
 		cluster.Timeout = time.Second * 2
-
 		session, err := cluster.CreateSession()
 		if err == nil {
-			// Step 2: Create keyspace/table
 			session.Query(`CREATE KEYSPACE IF NOT EXISTS monzopay WITH replication = {'class':'SimpleStrategy','replication_factor':1}`).Exec()
 			session.Query(`CREATE TABLE IF NOT EXISTS monzopay.payments (
-                idempotency_key text PRIMARY KEY,
-                payment_id text,
-                from_account text,
-                to_account text,
-                amount double,
-                status text,
-                created_at timestamp
-            )`).Exec()
+				idempotency_key text PRIMARY KEY, 
+				payment_id text, 
+				from_account text, 
+				to_account text, 
+				amount bigint, 
+				status text, 
+				created_at timestamp)`).Exec()
 			session.Close()
-
-			// Step 3: Reconnect WITH keyspace
 			cluster.Keyspace = "monzopay"
 			var err2 error
 			cassandra, err2 = cluster.CreateSession()
 			if err2 == nil {
-				log.Println("✅ Cassandra ready!")
+				log.Println("Cassandra ready!")
 				return
 			}
 		}
-
-		log.Printf("Cassandra retry %d/30: %v", i+1, err)
 		time.Sleep(time.Second)
 	}
-
-	log.Fatal("Cassandra failed after 30 retries")
+	log.Fatal("Cassandra failed")
 }
 
-// NEW: Initialize OpenTelemetry (connects to your Tempo container)
 func initTracing() {
-	exporter, err := otlptracegrpc.New(context.Background(),
-		otlptracegrpc.WithInsecure(),
-		otlptracegrpc.WithEndpoint("tempo:4317"),
-	)
-	if err != nil {
-		log.Printf("Tracing warning (OK for now): %v", err)
-		return
-	}
-
-	resource, _ := resource.New(context.Background(),
-		resource.WithAttributes(semconv.ServiceNameKey.String("monzopay")),
-	)
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(resource),
-	)
+	exporter, _ := otlptracegrpc.New(context.Background(), otlptracegrpc.WithInsecure(), otlptracegrpc.WithEndpoint("tempo:4317"))
+	resource, _ := resource.New(context.Background(), resource.WithAttributes(semconv.ServiceNameKey.String("monzopay")))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter), sdktrace.WithResource(resource))
 	otel.SetTracerProvider(tp)
-	tracer = otel.Tracer("monzopay")
-	log.Println("OpenTelemetry → Tempo ready!")
 }
 
 type server struct {
 	pb.UnimplementedPaymentServiceServer
+	svc *service.PaymentService
 }
 
 func (s *server) Healthz(context.Context, *emptypb.Empty) (*pb.HealthResponse, error) {
@@ -100,74 +82,115 @@ func (s *server) Healthz(context.Context, *emptypb.Empty) (*pb.HealthResponse, e
 }
 
 func (s *server) ProcessPayment(ctx context.Context, req *pb.ProcessPaymentRequest) (*pb.ProcessPaymentResponse, error) {
-	ctx, span := tracer.Start(ctx, "ProcessPayment", trace.WithAttributes(
-		attribute.String("payment.from_account", req.FromAccount),
-		attribute.String("payment.to_account", req.ToAccount),
-		attribute.Float64("payment.amount", req.Amount),
-		attribute.String("payment.idempotency_key", req.IdempotencyKey),
-	))
-	defer span.End()
-
-	key := req.IdempotencyKey
-	if key == "" {
-		key = gocql.TimeUUID().String()
-	}
-
-	// Check idempotency key
-	_, dbSpan1 := tracer.Start(ctx, "Cassandra.IdempotencyCheck")
-	var existingID, paymentStatus string // "paymentStatus" not "status"
-	err := cassandra.Query(`SELECT payment_id, status FROM monzopay.payments WHERE idempotency_key = ?`, key).
-		Scan(&existingID, &paymentStatus)
-	dbSpan1.End()
-
-	if err == nil {
-		span.AddEvent("✅ Idempotency hit")
-		return &pb.ProcessPaymentResponse{
-			PaymentId: existingID,
-			Status:    paymentStatus,
-			TraceId:   span.SpanContext().TraceID().String(),
-		}, nil
-	}
-
-	paymentID := "pay_" + time.Now().Format("20060102_150405") + "_" + gocql.TimeUUID().String()[:8]
-
-	// Insert new payment
-	_, dbSpan2 := tracer.Start(ctx, "Cassandra.InsertPayment")
-	err = cassandra.Query(`INSERT INTO monzopay.payments 
-        (idempotency_key, payment_id, from_account, to_account, amount, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'ACCEPTED', ?)`,
-		key, paymentID, req.FromAccount, req.ToAccount, req.Amount, time.Now()).Exec()
-	dbSpan2.End()
-
+	id, paymentStatus, err := s.svc.ProcessPayment(ctx, req.IdempotencyKey, req.FromAccount, req.ToAccount, req.Amount)
 	if err != nil {
-		span.RecordError(err)
-		return nil, status.Error(codes.Internal, "Database error")
+		return nil, status.Error(codes.Internal, err.Error())
 	}
-
-	span.AddEvent(fmt.Sprintf("Payment created: %s", paymentID))
-	log.Printf("New payment: %s | Trace ID: %s", paymentID, span.SpanContext().TraceID().String())
-
+	// Note: We use "paymentStatus" variable to avoid shadowing the "status" package
 	return &pb.ProcessPaymentResponse{
-		PaymentId: paymentID,
-		Status:    "ACCEPTED",
-		TraceId:   span.SpanContext().TraceID().String(),
+		PaymentId: id,
+		Status:    paymentStatus,
 	}, nil
 }
 
 func main() {
 	initTracing()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g, ctx := errgroup.WithContext(ctx)
+
+	// 1. Run gRPC Server (Core)
+	g.Go(func() error {
+		return runGRPCServer(ctx)
+	})
+
+	// 2. Run HTTP Server (Gateway)
+	g.Go(func() error {
+		return runRESTServer(ctx)
+	})
+
+	// 3. Handle Shutdown
+	g.Go(func() error {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		select {
+		case <-sigChan:
+			cancel()
+		case <-ctx.Done():
+		}
+		return nil
+	})
+
+	log.Println("MonzoPay running on :8080 (gRPC) and :8081 (HTTP)")
+	if err := g.Wait(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runGRPCServer(ctx context.Context) error {
 	lis, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		return err
 	}
 
-	s := grpc.NewServer()
-	pb.RegisterPaymentServiceServer(s, &server{})
+	// WIRE UP DEPENDENCIES HERE
+	repo := repository.NewCassandraRepository(cassandra)
+	svc := service.NewPaymentService(repo)
+
+	s := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))
+	pb.RegisterPaymentServiceServer(s, &server{svc: svc})
 	reflection.Register(s)
 
-	log.Printf("Tracing on :8080 → http://localhost:3000")
-	if err := s.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	go func() {
+		<-ctx.Done()
+		s.GracefulStop()
+	}()
+	return s.Serve(lis)
+}
+
+func runRESTServer(ctx context.Context) error {
+	mux := http.NewServeMux()
+
+	// Connect internally to gRPC
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	}
+	conn, err := grpc.NewClient("localhost:8080", opts...)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewPaymentServiceClient(conn)
+
+	mux.HandleFunc("POST /payment", func(w http.ResponseWriter, r *http.Request) {
+		var req pb.ProcessPaymentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		resp, err := client.ProcessPayment(r.Context(), &req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	srv := &http.Server{
+		Addr:    ":8081",
+		Handler: otelhttp.NewHandler(mux, "http-gateway"),
+	}
+
+	go func() {
+		<-ctx.Done()
+		srv.Shutdown(context.Background())
+	}()
+
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }

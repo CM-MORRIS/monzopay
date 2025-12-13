@@ -11,5 +11,5 @@ FROM alpine:latest
 RUN apk add --no-cache ca-certificates
 WORKDIR /root/
 COPY --from=builder /app/monzopay .
-EXPOSE 8080
+EXPOSE 8080 8081
 CMD ["./monzopay"]
