@@ -84,6 +84,8 @@ services:
       - "8081:8081"
     environment:
       - CASSANDRA_HOST=cassandra
+      - KAFKA_BROKERS=kafka:29092
+
     depends_on:
       kafka:
         condition: service_started

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	pb "github.com/CM-MORRIS/monzopay/generated"
+	"github.com/CM-MORRIS/monzopay/internal/event"
 	"github.com/CM-MORRIS/monzopay/internal/repository"
 	"github.com/CM-MORRIS/monzopay/internal/service"
 	"github.com/gocql/gocql"
@@ -35,7 +37,7 @@ import (
 var cassandra *gocql.Session
 
 func init() {
-	// ... your existing Cassandra init logic ...
+
 	for i := 0; i < 30; i++ {
 		cluster := gocql.NewCluster("cassandra")
 		cluster.Consistency = gocql.Quorum
@@ -100,17 +102,28 @@ func main() {
 	defer cancel()
 	g, ctx := errgroup.WithContext(ctx)
 
-	// 1. Run gRPC Server (Core)
+	// Run gRPC Server (Core)
 	g.Go(func() error {
 		return runGRPCServer(ctx)
 	})
 
-	// 2. Run HTTP Server (Gateway)
+	// Run HTTP Server (Gateway)
 	g.Go(func() error {
 		return runRESTServer(ctx)
 	})
 
-	// 3. Handle Shutdown
+	// Start Kafka Consumer Worker
+	g.Go(func() error {
+		kafkaAddr := os.Getenv("KAFKA_BROKERS")
+		if kafkaAddr == "" {
+			kafkaAddr = "kafka:29092"
+		}
+
+		log.Println("Starting Background Worker (Consumer)...")
+		return event.RunConsumer(ctx, []string{kafkaAddr}, "monzo-fraud-group")
+	})
+
+	// 4. Handle Shutdown
 	g.Go(func() error {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -134,9 +147,20 @@ func runGRPCServer(ctx context.Context) error {
 		return err
 	}
 
-	// WIRE UP DEPENDENCIES HERE
+	// Setup Kafka Producer
+	kafkaAddr := os.Getenv("KAFKA_BROKERS")
+	if kafkaAddr == "" {
+		kafkaAddr = "kafka:29092" // Default for Docker
+	}
+
+	producer, err := event.NewSaramaProducer([]string{kafkaAddr})
+	if err != nil {
+		return fmt.Errorf("failed to create kafka producer: %w", err)
+	}
+	defer producer.Close() // Clean up when server stops
+
 	repo := repository.NewCassandraRepository(cassandra)
-	svc := service.NewPaymentService(repo)
+	svc := service.NewPaymentService(repo, producer)
 
 	s := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))
 	pb.RegisterPaymentServiceServer(s, &server{svc: svc})
@@ -146,6 +170,8 @@ func runGRPCServer(ctx context.Context) error {
 		<-ctx.Done()
 		s.GracefulStop()
 	}()
+
+	log.Println("✅ gRPC Server listening on :8080")
 	return s.Serve(lis)
 }
 

@@ -5,16 +5,21 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/CM-MORRIS/monzopay/internal/event"
 	"github.com/CM-MORRIS/monzopay/internal/repository"
 	"github.com/gocql/gocql"
 )
 
 type PaymentService struct {
-	repo repository.PaymentRepository
+	repo     repository.PaymentRepository
+	producer event.Producer
 }
 
-func NewPaymentService(repo repository.PaymentRepository) *PaymentService {
-	return &PaymentService{repo: repo}
+func NewPaymentService(repo repository.PaymentRepository, producer event.Producer) *PaymentService {
+	return &PaymentService{
+		repo:     repo,
+		producer: producer,
+	}
 }
 
 // ProcessPayment handles the business logic
@@ -47,6 +52,13 @@ func (s *PaymentService) ProcessPayment(ctx context.Context, idempotencyKey, fro
 	if err := s.repo.Create(ctx, newPayment); err != nil {
 		return "", "", fmt.Errorf("failed to create payment: %w", err)
 	}
+
+	go func() {
+		err := s.producer.PublishPayment(paymentID, "ACCEPTED", amount)
+		if err != nil {
+			fmt.Printf("⚠️ Failed to publish event: %v\n", err)
+		}
+	}()
 
 	return paymentID, "ACCEPTED", nil
 }
